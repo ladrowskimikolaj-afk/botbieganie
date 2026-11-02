@@ -1,1 +1,47 @@
+YAML
+name: Garmin Running Bot
 
+on:
+  schedule:
+    - cron: '*/5 * * * *'       # Nasłuch Telegrama co 5 min
+    - cron: '0 5 * * *'         # Poranny pobór danych o 7:00 czasu PL
+    - cron: '30 19 * * *'       # Wieczorna ocena dnia o 21:30 czasu PL
+    - cron: '0 6 1 * *'         # Raport miesięczny 1. dnia miesiąca o 8:00
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Tryb uruchomienia (poll, morning, evening, monthly, setup, garmin-login)'
+        required: true
+        default: 'poll'
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run Bot
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          GOOGLE_CREDS_JSON: ${{ secrets.GOOGLE_CREDS_JSON }}
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+          GARMIN_EMAIL: ${{ secrets.GARMIN_EMAIL }}
+          GARMIN_PASSWORD: ${{ secrets.GARMIN_PASSWORD }}
+        run: |
+          MODE="${{ github.event.inputs.mode }}"
+          if [ -z "$MODE" ]; then
+            MODE="poll"
+          fi
+          python bot_runner.py $MODE
