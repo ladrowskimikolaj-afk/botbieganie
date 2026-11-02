@@ -1,3 +1,6 @@
-gspread>=6.0
-requests>=2.31
-garminconnect>=0.2.25
+anthropic
+garminconnect
+gspread
+google-auth
+requests
+groq
