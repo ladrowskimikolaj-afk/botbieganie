@@ -29,7 +29,7 @@ TZ = ZoneInfo("Europe/Warsaw")
 ENV = os.environ
 MODEL = ENV.get("CLAUDE_MODEL", "claude-sonnet-5-5")
 GEMINI_MODEL = ENV.get("GEMINI_MODEL", "gemini-3.8-flash")
-POLL_SECONDS = int(ENV.get("POLL_SECONDS", "0"))
+POLL_SECONDS = int(ENV.get("POLL_SECONDS", "240"))
 
 GARMIN, DZ, KAL, GEAR, STAN = "Dane Garmin", "Dziennik Treningów", "Kalendarz", "Sprzęt", "Stan"
 SCHEMA = {
@@ -60,10 +60,23 @@ def today():
 
 # ───────────────────────── Google Sheets ─────────────────────────
 _sh = None
+ARG_SEP = ","
+
+
+def _loc(f):
+    """Formuły wysyłane przez API są parsowane wg ustawień regionalnych arkusza (PL = średniki)."""
+    if ARG_SEP == "," or not isinstance(f, str) or not f.startswith("="):
+        return f
+    out, q = [], False
+    for ch in f:
+        if ch == '"':
+            q = not q
+        out.append(";" if (ch == "," and not q) else ch)
+    return "".join(out)
 
 
 def sheet():
-    global _sh
+    global _sh, ARG_SEP
     if _sh is None:
         raw = ENV.get("GOOGLE_CREDS_JSON")
         if not raw:  # lokalnie: plik google_creds.json obok skryptu
@@ -71,6 +84,11 @@ def sheet():
                 raw = f.read()
         creds = json.loads(raw)
         _sh = gspread.service_account_from_dict(creds).open_by_key(ENV["SHEET_ID"])
+        try:
+            loc = getattr(_sh, "locale", "") or ""
+        except Exception:
+            loc = ""
+        ARG_SEP = "," if (not loc or loc[:2] in ("en", "ja", "zh", "ko", "he", "th")) else ";"
     return _sh
 
 
@@ -123,7 +141,7 @@ def setup():
     for r in range(2, 52):
         f = (f"=IF(A{r}=\"\",\"\",E{r}+SUMIF('{DZ}'!J:J,A{r},'{DZ}'!D:D))")
         z = f"=IF(OR(A{r}=\"\",D{r}=\"\"),\"\",ROUND(F{r}/D{r}*100,0))"
-        rows.append([f, z])
+        rows.append([_loc(f), _loc(z)])
     g.update(range_name="F2:G51", values=rows, value_input_option="USER_ENTERED")
     if "Arkusz1" in existing and len(sh.worksheets()) > 1:
         try:
@@ -320,19 +338,23 @@ def build_dashboard():
     G, Z, K = f"'{GARMIN}'", f"'{DZ}'", f"'{KAL}'"
     UE = "USER_ENTERED"
 
+    def dp(**k):
+        k["values"] = [[_loc(c) for c in row] for row in k["values"]]
+        d.update(**k)
+
     # --- dane pod wykresy (ostatnie 30 wpisów, rosnąco po dacie)
-    d.update(range_name="A1", values=[["Data", "Sen (h)", "Wynik snu", "Body Battery rano",
+    dp(range_name="A1", values=[["Data", "Sen (h)", "Wynik snu", "Body Battery rano",
                                        "Tetno spoczynkowe", "Stres sr.", "Kroki"]], value_input_option=UE)
-    d.update(range_name="I1", values=[["Data", "Ocena dnia"]], value_input_option=UE)
-    d.update(range_name="L1", values=[["Data", "Dystans km", "Czas min", "Tetno sr.",
+    dp(range_name="I1", values=[["Data", "Ocena dnia"]], value_input_option=UE)
+    dp(range_name="L1", values=[["Data", "Dystans km", "Czas min", "Tetno sr.",
                                        "Tempo (min/km, ulamek dziesietny)"]], value_input_option=UE)
-    d.update(range_name="A2", value_input_option=UE, values=[[
+    dp(range_name="A2", value_input_option=UE, values=[[
         f'=IFERROR(SORT(QUERY({G}!A2:I,"select A,B,C,D,F,G,I where A is not null order by A desc limit 30",0),1,TRUE),"")']])
-    d.update(range_name="I2", value_input_option=UE, values=[[
+    dp(range_name="I2", value_input_option=UE, values=[[
         f'=IFERROR(SORT(QUERY({K}!A2:B,"select A,B where A is not null and B is not null order by A desc limit 30",0),1,TRUE),"")']])
-    d.update(range_name="L2", value_input_option=UE, values=[[
+    dp(range_name="L2", value_input_option=UE, values=[[
         f'=IFERROR(SORT(QUERY({Z}!A2:N,"select A,D,E,N where C=\'wykonany\' and D is not null order by A desc limit 30",0),1,TRUE),"")']])
-    d.update(range_name="P2", value_input_option=UE, values=[[
+    dp(range_name="P2", value_input_option=UE, values=[[
         '=ARRAYFORMULA(IF(M2:M31="","",ROUND(N2:N31/M2:M31,2)))']])
 
     # --- kafelki
@@ -362,7 +384,7 @@ def build_dashboard():
     for i, (lab, f) in enumerate(month):
         put(9, i * 2, lab)
         put(10, i * 2, f)
-    p.update(range_name="A1", values=grid, value_input_option=UE)
+    p.update(range_name="A1", values=[[_loc(c) for c in row] for row in grid], value_input_option=UE)
 
     sid, did = p.id, d.id
     rgb = _rgb
@@ -717,7 +739,7 @@ def handle_update(u):
         evening(force=True)
         return
     if text.startswith("/raport"):
-        monthly()
+        monthly(force=True)
         return
     tg_send(handle_text(text))
 
@@ -741,7 +763,25 @@ def check_new_runs():
     NEW_RUNS.clear()
 
 
+def run_scheduled_tasks():
+    """Poranek / wieczór / raport uruchamiane też z pętli poll, bo cron GitHuba bywa opóźniany o godziny."""
+    n = now()
+    ds = n.date().isoformat()
+    jobs = [
+        (7 <= n.hour < 12, "morning_done", ds, morning),
+        ((n.hour, n.minute) >= (21, 30), "evening_done", ds, evening),
+        (n.day == 1 and n.hour >= 8, "monthly_done", ds[:7], monthly),
+    ]
+    for due, flag, val, fn in jobs:
+        try:
+            if due and state_get(flag) != val:
+                fn()
+        except Exception as e:
+            log("Zadanie cykliczne:", fn.__name__, repr(e))
+
+
 def poll():
+    run_scheduled_tasks()
     try:
         check_new_runs()
     except Exception as e:
@@ -772,7 +812,11 @@ def poll():
 
 
 # ───────────────────────── Poranek ─────────────────────────
-def morning():
+def morning(force=False):
+    ds0 = today().isoformat()
+    if not force and state_get("morning_done") == ds0:
+        return
+    state_set("morning_done", ds0)
     d = today()
     try:
         g = garmin_client()
@@ -795,6 +839,10 @@ def morning():
 
 # ───────────────────────── Wieczór ─────────────────────────
 def evening(force=False):
+    ds0 = today().isoformat()
+    if not force and state_get("evening_done") == ds0:
+        return
+    state_set("evening_done", ds0)
     ds = today().isoformat()
     if not force and any(str(r.get("Data")) == ds for r in records(KAL)):
         log("Ocena dnia już istnieje.")
@@ -830,7 +878,11 @@ Brak treningu przy wysokim stresie lub niskiej regeneracji to nie jest minus. Je
 
 
 # ───────────────────────── Raport miesięczny ─────────────────────────
-def monthly():
+def monthly(force=False):
+    key = today().isoformat()[:7]
+    if not force and state_get("monthly_done") == key:
+        return
+    state_set("monthly_done", key)
     first_this = today().replace(day=1)
     last_prev = first_this - timedelta(days=1)
     start, end = last_prev.replace(day=1).isoformat(), last_prev.isoformat()
@@ -956,11 +1008,11 @@ def main():
     elif mode == "poll":
         poll()
     elif mode == "morning":
-        morning()
+        morning(force="--at" not in args)
     elif mode == "evening":
-        evening()
+        evening(force="--at" not in args)
     elif mode == "monthly":
-        monthly()
+        monthly(force="--at" not in args)
     else:
         sys.exit(f"Nieznany tryb: {mode}")
 
