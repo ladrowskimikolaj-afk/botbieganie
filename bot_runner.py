@@ -29,7 +29,7 @@ TZ = ZoneInfo("Europe/Warsaw")
 ENV = os.environ
 MODEL = ENV.get("CLAUDE_MODEL", "claude-sonnet-5-5")
 GEMINI_MODEL = ENV.get("GEMINI_MODEL", "gemini-3.8-flash")
-POLL_SECONDS = int(ENV.get("POLL_SECONDS", "240"))
+POLL_SECONDS = int(ENV.get("POLL_SECONDS", "0"))
 
 GARMIN, DZ, KAL, GEAR, STAN = "Dane Garmin", "Dziennik Treningów", "Kalendarz", "Sprzęt", "Stan"
 SCHEMA = {
@@ -134,6 +134,10 @@ def setup():
         style_sheets()
     except Exception as e:
         log("Formatowanie arkusza nie wyszło (dane są OK):", repr(e))
+    try:
+        build_dashboard()
+    except Exception as e:
+        log("Pulpit nie wyszedł (dane są OK):", repr(e))
     log("Arkusz gotowy.")
 
 
@@ -300,6 +304,141 @@ def import_garmin_runs(g, d):
     return added
 
 
+PULPIT, DANE = "Pulpit", "Wykresy_dane"
+
+
+def build_dashboard():
+    """Zakładka Pulpit: kafelki + 8 wykresów (źródło: ukryta zakładka Wykresy_dane). Odtwarzana przy każdym setup."""
+    sh = sheet()
+    for name in (PULPIT, DANE):
+        try:
+            sh.del_worksheet(sh.worksheet(name))
+        except Exception:
+            pass
+    p = sh.add_worksheet(PULPIT, 90, 12, index=0)
+    d = sh.add_worksheet(DANE, 40, 20)
+    G, Z, K = f"'{GARMIN}'", f"'{DZ}'", f"'{KAL}'"
+    UE = "USER_ENTERED"
+
+    # --- dane pod wykresy (ostatnie 30 wpisów, rosnąco po dacie)
+    d.update(range_name="A1", values=[["Data", "Sen (h)", "Wynik snu", "Body Battery rano",
+                                       "Tetno spoczynkowe", "Stres sr.", "Kroki"]], value_input_option=UE)
+    d.update(range_name="I1", values=[["Data", "Ocena dnia"]], value_input_option=UE)
+    d.update(range_name="L1", values=[["Data", "Dystans km", "Czas min", "Tetno sr.",
+                                       "Tempo (min/km, ulamek dziesietny)"]], value_input_option=UE)
+    d.update(range_name="A2", value_input_option=UE, values=[[
+        f'=IFERROR(SORT(QUERY({G}!A2:I,"select A,B,C,D,F,G,I where A is not null order by A desc limit 30",0),1,TRUE),"")']])
+    d.update(range_name="I2", value_input_option=UE, values=[[
+        f'=IFERROR(SORT(QUERY({K}!A2:B,"select A,B where A is not null and B is not null order by A desc limit 30",0),1,TRUE),"")']])
+    d.update(range_name="L2", value_input_option=UE, values=[[
+        f'=IFERROR(SORT(QUERY({Z}!A2:N,"select A,D,E,N where C=\'wykonany\' and D is not null order by A desc limit 30",0),1,TRUE),"")']])
+    d.update(range_name="P2", value_input_option=UE, values=[[
+        '=ARRAYFORMULA(IF(M2:M31="","",ROUND(N2:N31/M2:M31,2)))']])
+
+    # --- kafelki
+    last = lambda col: (f'=IFERROR(LOOKUP(2,1/({G}!{col}2:{col}<>""),{G}!{col}2:{col}),"–")')
+    pref = '(YEAR(TODAY())&"-"&TEXT(MONTH(TODAY()),"00")&"*")'
+    x = f'(SUMIFS({Z}!E:E,{Z}!A:A,{pref},{Z}!C:C,"wykonany")/SUMIFS({Z}!D:D,{Z}!A:A,{pref},{Z}!C:C,"wykonany"))'
+    grid = [[""] * 12 for _ in range(10)]
+
+    def put(r, c, v):
+        grid[r - 1][c] = v
+    put(1, 0, "🏃 Pulpit biegacza")
+    put(2, 0, '="Dane z Garmina odświeżone: "&IFERROR(INDEX(Stan!B:B,MATCH("garmin_last_update",Stan!A:A,0)),"jeszcze nie odświeżano")')
+    put(4, 0, "DZIŚ (ostatnie dostępne dane z Garmina)")
+    for i, (lab, col) in enumerate([("Sen (h)", "B"), ("Wynik snu", "C"), ("Body Battery rano", "D"),
+                                    ("Tętno spoczynkowe", "F"), ("Stres średni", "G"), ("Kroki", "I")]):
+        put(5, i * 2, lab)
+        put(6, i * 2, last(col))
+    put(8, 0, "TEN MIESIĄC")
+    month = [
+        ("Kilometry", f'=ROUND(SUMIFS({Z}!D:D,{Z}!A:A,{pref},{Z}!C:C,"wykonany"),1)'),
+        ("Biegi", f'=COUNTIFS({Z}!A:A,{pref},{Z}!C:C,"wykonany")'),
+        ("Średnie tempo", f'=IFERROR(INT{x}&":"&TEXT(ROUND(({x}-INT{x})*60,0),"00"),"–")'),
+        ("Średnia ocena dnia", f'=IFERROR(ROUND(AVERAGEIFS({K}!B:B,{K}!A:A,{pref}),1),"–")'),
+        ("Przełożone / odpuszczone", f'=COUNTIFS({Z}!A:A,{pref},{Z}!C:C,"przełożony")+COUNTIFS({Z}!A:A,{pref},{Z}!C:C,"odpuszczony")'),
+        ("Średni wynik snu", f'=IFERROR(ROUND(AVERAGE({G}!C2:C),0),"–")'),
+    ]
+    for i, (lab, f) in enumerate(month):
+        put(9, i * 2, lab)
+        put(10, i * 2, f)
+    p.update(range_name="A1", values=grid, value_input_option=UE)
+
+    sid, did = p.id, d.id
+    rgb = _rgb
+    navy, card = rgb(0.13, 0.24, 0.38), rgb(0.92, 0.95, 0.99)
+
+    def rg(r0, r1, c0, c1, s=sid):
+        return {"sheetId": s, "startRowIndex": r0, "endRowIndex": r1, "startColumnIndex": c0, "endColumnIndex": c1}
+
+    def fmt(r0, r1, c0, c1, f, fields):
+        return {"repeatCell": {"range": rg(r0, r1, c0, c1), "cell": {"userEnteredFormat": f},
+                               "fields": "userEnteredFormat(" + fields + ")"}}
+    reqs = []
+    for r in (0, 1, 3, 7):
+        reqs.append({"mergeCells": {"range": rg(r, r + 1, 0, 12), "mergeType": "MERGE_ALL"}})
+    for r in (4, 5, 8, 9):
+        for c in range(0, 12, 2):
+            reqs.append({"mergeCells": {"range": rg(r, r + 1, c, c + 2), "mergeType": "MERGE_ALL"}})
+    reqs.append({"updateDimensionProperties": {"range": {"sheetId": sid, "dimension": "COLUMNS", "startIndex": 0,
+                 "endIndex": 12}, "properties": {"pixelSize": 105}, "fields": "pixelSize"}})
+    for r, h in ((0, 48), (1, 26), (3, 30), (4, 26), (5, 52), (7, 30), (8, 26), (9, 52)):
+        reqs.append({"updateDimensionProperties": {"range": {"sheetId": sid, "dimension": "ROWS", "startIndex": r,
+                     "endIndex": r + 1}, "properties": {"pixelSize": h}, "fields": "pixelSize"}})
+    mid = {"horizontalAlignment": "CENTER", "verticalAlignment": "MIDDLE"}
+    reqs.append(fmt(0, 1, 0, 12, {**mid, "backgroundColor": navy,
+                                  "textFormat": {"bold": True, "fontSize": 20, "foregroundColor": rgb(1, 1, 1)}},
+                    "backgroundColor,textFormat,horizontalAlignment,verticalAlignment"))
+    reqs.append(fmt(1, 2, 0, 12, {**mid, "textFormat": {"italic": True, "fontSize": 9, "foregroundColor": rgb(.4, .4, .4)}},
+                    "textFormat,horizontalAlignment,verticalAlignment"))
+    for r in (3, 7):
+        reqs.append(fmt(r, r + 1, 0, 12, {"verticalAlignment": "MIDDLE", "backgroundColor": rgb(.82, .88, .96),
+                        "textFormat": {"bold": True, "fontSize": 11, "foregroundColor": navy}},
+                        "backgroundColor,textFormat,verticalAlignment"))
+    for r in (4, 8):
+        reqs.append(fmt(r, r + 1, 0, 12, {**mid, "backgroundColor": card,
+                        "textFormat": {"fontSize": 10, "foregroundColor": rgb(.35, .4, .5)}},
+                        "backgroundColor,textFormat,horizontalAlignment,verticalAlignment"))
+    for r in (5, 9):
+        reqs.append(fmt(r, r + 1, 0, 12, {**mid, "backgroundColor": card,
+                        "textFormat": {"bold": True, "fontSize": 22, "foregroundColor": navy}},
+                        "backgroundColor,textFormat,horizontalAlignment,verticalAlignment"))
+    reqs.append({"updateSheetProperties": {"properties": {"sheetId": sid, "gridProperties": {"hideGridlines": True},
+                 "tabColorStyle": {"rgbColor": navy}}, "fields": "gridProperties.hideGridlines,tabColorStyle"}})
+    sh.batch_update({"requests": reqs})
+
+    # --- wykresy (każdy osobno, żeby jeden błąd nie zablokował reszty)
+    def src(col):
+        return {"sourceRange": {"sources": [rg(0, 31, col, col + 1, did)]}}
+    colors = [rgb(.13, .45, .85), rgb(.95, .55, .15), rgb(.2, .65, .35), rgb(.8, .25, .3)]
+    charts = [
+        ("Regeneracja: Body Battery rano i wynik snu", "LINE", 0, [3, 2], 12, 0),
+        ("Sen (godziny)", "COLUMN", 0, [1], 12, 6),
+        ("Tętno spoczynkowe", "LINE", 0, [4], 28, 0),
+        ("Stres średni", "LINE", 0, [5], 28, 6),
+        ("Kroki dziennie", "COLUMN", 0, [6], 44, 0),
+        ("Ocena dnia (1-10)", "COLUMN", 8, [9], 44, 6),
+        ("Dystans biegów (km)", "COLUMN", 11, [12], 60, 0),
+        ("Tempo biegów (min/km, ułamek dziesiętny)", "LINE", 11, [15], 60, 6),
+    ]
+    for title, kind, dom, ser, r, c in charts:
+        spec = {"title": title, "hiddenDimensionStrategy": "SHOW_ALL", "basicChart": {
+            "chartType": kind, "headerCount": 1,
+            "legendPosition": "BOTTOM_LEGEND" if len(ser) > 1 else "NO_LEGEND",
+            "axis": [{"position": "BOTTOM_AXIS"}, {"position": "LEFT_AXIS"}],
+            "domains": [{"domain": src(dom)}],
+            "series": [{"series": src(sc), "targetAxis": "LEFT_AXIS", "colorStyle": {"rgbColor": colors[i % 4]}}
+                       for i, sc in enumerate(ser)]}}
+        pos = {"overlayPosition": {"anchorCell": {"sheetId": sid, "rowIndex": r, "columnIndex": c},
+                                   "widthPixels": 625, "heightPixels": 295, "offsetXPixels": 4, "offsetYPixels": 4}}
+        try:
+            sh.batch_update({"requests": [{"addChart": {"chart": {"spec": spec, "position": pos}}}]})
+        except Exception as e:
+            log("Wykres nie wyszedł:", title, repr(e)[:200])
+    sh.batch_update({"requests": [{"updateSheetProperties": {"properties": {"sheetId": did, "hidden": True},
+                                                             "fields": "hidden"}}]})
+
+
 def ensure_gear(name):
     w = ws(GEAR)
     names = w.col_values(1)
@@ -452,6 +591,14 @@ def upsert_garmin(g, d):
             w.batch_update(cells, value_input_option="RAW")
     else:
         w.append_row([blank(new.get(h)) for h in headers], value_input_option="RAW")
+    mark_garmin_update()
+
+
+def mark_garmin_update():
+    try:
+        state_set("garmin_last_update", now().strftime("%d.%m %H:%M"))
+    except Exception as e:
+        log("Znacznik aktualizacji:", repr(e))
 
 
 def garmin_row(ds):
