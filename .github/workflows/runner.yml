@@ -1,46 +1,59 @@
-name: Garmin Running Bot
+name: Dziennik Biegowy Bot
 
 on:
   schedule:
-    - cron: '*/5 * * * *'       # Nasłuch Telegrama co 5 min
-    - cron: '0 5 * * *'         # Poranny pobór danych o 7:00 czasu PL
-    - cron: '30 19 * * *'       # Wieczorna ocena dnia o 21:30 czasu PL
-    - cron: '0 6 1 * *'         # Raport miesięczny 1. dnia miesiąca o 8:00
+    - cron: "*/5 * * * *"      # nasłuch Telegrama (każdy przebieg ~4 min)
+    - cron: "0 5,6 * * *"      # poranek 07:00 czasu PL (lato=5 UTC, zima=6 UTC)
+    - cron: "30 19,20 * * *"   # wieczór 21:30 czasu PL (lato=19:30 UTC, zima=20:30 UTC)
+    - cron: "0 6,7 1 * *"      # raport 1. dnia miesiąca, 08:00 czasu PL
   workflow_dispatch:
     inputs:
       mode:
-        description: 'Tryb uruchomienia (poll, morning, evening, monthly, setup, garmin-login)'
-        required: true
-        default: 'poll'
+        description: "Tryb"
+        type: choice
+        default: poll
+        options: [poll, morning, evening, monthly, setup, test-garmin]
+
+# osobna kolejka dla każdego trybu; poll nigdy nie działa równolegle sam ze sobą
+concurrency:
+  group: bot-${{ (github.event.schedule == '*/5 * * * *' || inputs.mode == 'poll' || (github.event_name == 'workflow_dispatch' && inputs.mode == '')) && 'poll' || github.event.schedule || inputs.mode }}
+  cancel-in-progress: false
 
 jobs:
-  run-bot:
+  run:
     runs-on: ubuntu-latest
+    timeout-minutes: 8
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.12"
+          cache: pip
 
-      - name: Install dependencies
-        run: pip install -r requirements.txt
+      - run: pip install -r requirements.txt
 
-      - name: Run Bot
+      - name: Ustal tryb
+        id: m
+        env:
+          SCHEDULE: ${{ github.event.schedule }}
+          INPUT_MODE: ${{ inputs.mode }}
+        run: |
+          case "$SCHEDULE" in
+            "*/5 * * * *")     echo "args=poll" >> "$GITHUB_OUTPUT" ;;
+            "0 5,6 * * *")     echo "args=morning --at 07:00" >> "$GITHUB_OUTPUT" ;;
+            "30 19,20 * * *")  echo "args=evening --at 21:30" >> "$GITHUB_OUTPUT" ;;
+            "0 6,7 1 * *")     echo "args=monthly --at 08:00 --day 1" >> "$GITHUB_OUTPUT" ;;
+            *)                 echo "args=${INPUT_MODE:-poll}" >> "$GITHUB_OUTPUT" ;;
+          esac
+
+      - name: Uruchom bota
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GOOGLE_CREDS_JSON: ${{ secrets.GOOGLE_CREDS_JSON }}
           SHEET_ID: ${{ secrets.SHEET_ID }}
           GARMIN_EMAIL: ${{ secrets.GARMIN_EMAIL }}
           GARMIN_PASSWORD: ${{ secrets.GARMIN_PASSWORD }}
-        run: |
-          MODE="${{ github.event.inputs.mode }}"
-          if [ -z "$MODE" ]; then
-            MODE="poll"
-          fi
-          python bot_runner.py $MODE
+        run: python bot_runner.py ${{ steps.m.outputs.args }}
